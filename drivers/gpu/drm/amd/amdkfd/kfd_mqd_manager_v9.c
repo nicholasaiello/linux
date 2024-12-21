@@ -49,20 +49,20 @@ static uint64_t mqd_stride_v9(struct mqd_manager *mm,
 	return mm->mqd_size;
 }
 
-static inline struct v9_mqd *get_mqd(void *mqd)
+static inline volatile struct v9_mqd *get_mqd(void *mqd)
 {
-	return (struct v9_mqd *)mqd;
+	return (volatile struct v9_mqd *)mqd;
 }
 
-static inline struct v9_sdma_mqd *get_sdma_mqd(void *mqd)
+static inline volatile struct v9_sdma_mqd *get_sdma_mqd(void *mqd)
 {
-	return (struct v9_sdma_mqd *)mqd;
+	return (volatile struct v9_sdma_mqd *)mqd;
 }
 
 static void update_cu_mask(struct mqd_manager *mm, void *mqd,
 			struct mqd_update_info *minfo, uint32_t inst)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	uint32_t se_mask[KFD_MAX_NUM_SE] = {0};
 
 	if (!minfo || !minfo->cu_mask.ptr)
@@ -102,7 +102,7 @@ static void update_cu_mask(struct mqd_manager *mm, void *mqd,
 	}
 }
 
-static void set_priority(struct v9_mqd *m, struct queue_properties *q)
+static void set_priority(volatile struct v9_mqd *m, struct queue_properties *q)
 {
 	m->cp_hqd_pipe_priority = pipe_priority_map[q->priority];
 	m->cp_hqd_queue_priority = q->priority;
@@ -161,12 +161,12 @@ static void init_mqd(struct mqd_manager *mm, void **mqd,
 			struct queue_properties *q)
 {
 	uint64_t addr;
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 
 	m = (struct v9_mqd *) mqd_mem_obj->cpu_ptr;
 	addr = mqd_mem_obj->gpu_addr;
 
-	memset(m, 0, sizeof(struct v9_mqd));
+	memset_io(m, 0, sizeof(struct v9_mqd));
 
 	m->header = 0xC0310800;
 	m->compute_pipelinestat_enable = 1;
@@ -218,10 +218,10 @@ static void init_mqd(struct mqd_manager *mm, void **mqd,
 		m->cp_hqd_wg_state_offset = q->ctl_stack_size;
 	}
 
-	*mqd = m;
+	*mqd = (volatile void *) m;
 	if (gart_addr)
 		*gart_addr = addr;
-	update_mqd(mm, m, q, NULL);
+	update_mqd(mm, (volatile void *)m, q, NULL);
 }
 
 static int load_mqd(struct mqd_manager *mm, void *mqd,
@@ -240,7 +240,7 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
 			struct queue_properties *q,
 			struct mqd_update_info *minfo)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 
 	m = get_mqd(mqd);
 
@@ -320,7 +320,7 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
 
 static bool check_preemption_failed(struct mqd_manager *mm, void *mqd)
 {
-	struct v9_mqd *m = (struct v9_mqd *)mqd;
+	volatile struct v9_mqd *m = (volatile struct v9_mqd *) mqd;
 	uint32_t doorbell_id = m->queue_doorbell_id0;
 
 	m->queue_doorbell_id0 = 0;
@@ -334,7 +334,7 @@ static int get_wave_state(struct mqd_manager *mm, void *mqd,
 			  u32 *ctl_stack_used_size,
 			  u32 *save_area_used_size)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	struct kfd_context_save_area_header header;
 
 	/* Control stack is located one page after MQD. */
@@ -366,20 +366,20 @@ static int get_wave_state(struct mqd_manager *mm, void *mqd,
 
 static void get_checkpoint_info(struct mqd_manager *mm, void *mqd, u32 *ctl_stack_size)
 {
-	struct v9_mqd *m = get_mqd(mqd);
+	volatile struct v9_mqd *m = get_mqd(mqd);
 
 	*ctl_stack_size = m->cp_hqd_cntl_stack_size;
 }
 
 static void checkpoint_mqd(struct mqd_manager *mm, void *mqd, void *mqd_dst, void *ctl_stack_dst)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	/* Control stack is located one page after MQD. */
 	void *ctl_stack = (void *)((uintptr_t)mqd + PAGE_SIZE);
 
 	m = get_mqd(mqd);
 
-	memcpy(mqd_dst, m, sizeof(struct v9_mqd));
+	memcpy_fromio(mqd_dst, m, sizeof(struct v9_mqd));
 	memcpy(ctl_stack_dst, ctl_stack, m->cp_hqd_cntl_stack_size);
 }
 
@@ -390,15 +390,15 @@ static void restore_mqd(struct mqd_manager *mm, void **mqd,
 			const void *ctl_stack_src, u32 ctl_stack_size)
 {
 	uint64_t addr;
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	void *ctl_stack;
 
 	m = (struct v9_mqd *) mqd_mem_obj->cpu_ptr;
 	addr = mqd_mem_obj->gpu_addr;
 
-	memcpy(m, mqd_src, sizeof(*m));
+	memcpy_toio(m, mqd_src, sizeof(*m));
 
-	*mqd = m;
+	*mqd = (volatile void *) m;
 	if (gart_addr)
 		*gart_addr = addr;
 
@@ -419,7 +419,7 @@ static void init_mqd_hiq(struct mqd_manager *mm, void **mqd,
 			struct kfd_mem_obj *mqd_mem_obj, uint64_t *gart_addr,
 			struct queue_properties *q)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 
 	init_mqd(mm, mqd, mqd_mem_obj, gart_addr, q);
 
@@ -434,7 +434,7 @@ static int destroy_hiq_mqd(struct mqd_manager *mm, void *mqd,
 			uint32_t pipe_id, uint32_t queue_id)
 {
 	int err;
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	u32 doorbell_off;
 
 	m = get_mqd(mqd);
@@ -452,17 +452,17 @@ static void init_mqd_sdma(struct mqd_manager *mm, void **mqd,
 		struct kfd_mem_obj *mqd_mem_obj, uint64_t *gart_addr,
 		struct queue_properties *q)
 {
-	struct v9_sdma_mqd *m;
+	volatile struct v9_sdma_mqd *m;
 
 	m = (struct v9_sdma_mqd *) mqd_mem_obj->cpu_ptr;
 
-	memset(m, 0, sizeof(struct v9_sdma_mqd));
+	memset_io(m, 0, sizeof(struct v9_sdma_mqd));
 
-	*mqd = m;
+	*mqd = (volatile void *) m;
 	if (gart_addr)
 		*gart_addr = mqd_mem_obj->gpu_addr;
 
-	mm->update_mqd(mm, m, q, NULL);
+	mm->update_mqd(mm, (volatile void *)m, q, NULL);
 }
 
 #define SDMA_RLC_DUMMY_DEFAULT 0xf
@@ -471,7 +471,7 @@ static void update_mqd_sdma(struct mqd_manager *mm, void *mqd,
 			struct queue_properties *q,
 			struct mqd_update_info *minfo)
 {
-	struct v9_sdma_mqd *m;
+	volatile struct v9_sdma_mqd *m;
 
 	m = get_sdma_mqd(mqd);
 	m->sdmax_rlcx_rb_cntl = order_base_2(q->queue_size / 4)
@@ -499,11 +499,11 @@ static void checkpoint_mqd_sdma(struct mqd_manager *mm,
 				void *mqd_dst,
 				void *ctl_stack_dst)
 {
-	struct v9_sdma_mqd *m;
+	volatile struct v9_sdma_mqd *m;
 
 	m = get_sdma_mqd(mqd);
 
-	memcpy(mqd_dst, m, sizeof(struct v9_sdma_mqd));
+	memcpy_fromio(mqd_dst, m, sizeof(struct v9_sdma_mqd));
 }
 
 static void restore_mqd_sdma(struct mqd_manager *mm, void **mqd,
@@ -513,17 +513,17 @@ static void restore_mqd_sdma(struct mqd_manager *mm, void **mqd,
 			     const void *ctl_stack_src, const u32 ctl_stack_size)
 {
 	uint64_t addr;
-	struct v9_sdma_mqd *m;
+	volatile struct v9_sdma_mqd *m;
 
 	m = (struct v9_sdma_mqd *) mqd_mem_obj->cpu_ptr;
 	addr = mqd_mem_obj->gpu_addr;
 
-	memcpy(m, mqd_src, sizeof(*m));
+	memcpy_toio(m, mqd_src, sizeof(*m));
 
 	m->sdmax_rlcx_doorbell_offset =
 		qp->doorbell_off << SDMA0_RLC0_DOORBELL_OFFSET__OFFSET__SHIFT;
 
-	*mqd = m;
+	*mqd = (volatile void *) m;
 	if (gart_addr)
 		*gart_addr = addr;
 
@@ -534,12 +534,12 @@ static void init_mqd_hiq_v9_4_3(struct mqd_manager *mm, void **mqd,
 			struct kfd_mem_obj *mqd_mem_obj, uint64_t *gart_addr,
 			struct queue_properties *q)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	int xcc = 0;
 	struct kfd_mem_obj xcc_mqd_mem_obj;
 	uint64_t xcc_gart_addr = 0;
 
-	memset(&xcc_mqd_mem_obj, 0x0, sizeof(struct kfd_mem_obj));
+	memset_io(&xcc_mqd_mem_obj, 0x0, sizeof(struct kfd_mem_obj));
 
 	for (xcc = 0; xcc < NUM_XCC(mm->dev->xcc_mask); xcc++) {
 		kfd_get_hiq_xcc_mqd(mm->dev, &xcc_mqd_mem_obj, xcc);
@@ -558,7 +558,7 @@ static void init_mqd_hiq_v9_4_3(struct mqd_manager *mm, void **mqd,
 			m->cp_hqd_pq_control &= ~CP_HQD_PQ_CONTROL__NO_UPDATE_RPTR_MASK;
 
 			/* Set the MQD pointer and gart address to XCC0 MQD */
-			*mqd = m;
+			*mqd = (volatile void *) m;
 			*gart_addr = xcc_gart_addr;
 		}
 	}
@@ -595,7 +595,7 @@ static int destroy_hiq_mqd_v9_4_3(struct mqd_manager *mm, void *mqd,
 	uint32_t xcc_mask = mm->dev->xcc_mask;
 	int xcc_id, err, inst = 0;
 	uint64_t hiq_mqd_size = kfd_hiq_mqd_stride(mm->dev);
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	u32 doorbell_off;
 
 	for_each_inst(xcc_id, xcc_mask) {
@@ -649,7 +649,7 @@ static void init_mqd_v9_4_3(struct mqd_manager *mm, void **mqd,
 			struct kfd_mem_obj *mqd_mem_obj, uint64_t *gart_addr,
 			struct queue_properties *q)
 {
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	int xcc = 0;
 	struct kfd_mem_obj xcc_mqd_mem_obj;
 	uint64_t xcc_gart_addr = 0;
@@ -657,7 +657,7 @@ static void init_mqd_v9_4_3(struct mqd_manager *mm, void **mqd,
 	uint64_t offset = mm->mqd_stride(mm, q);
 	uint32_t local_xcc_start = mm->dev->dqm->current_logical_xcc_start++;
 
-	memset(&xcc_mqd_mem_obj, 0x0, sizeof(struct kfd_mem_obj));
+	memset_io(&xcc_mqd_mem_obj, 0x0, sizeof(struct kfd_mem_obj));
 	for (xcc = 0; xcc < NUM_XCC(mm->dev->xcc_mask); xcc++) {
 		get_xcc_mqd(mqd_mem_obj, &xcc_mqd_mem_obj, offset*xcc);
 
@@ -705,7 +705,7 @@ static void init_mqd_v9_4_3(struct mqd_manager *mm, void **mqd,
 
 		if (xcc == 0) {
 			/* Set the MQD pointer and gart address to XCC0 MQD */
-			*mqd = m;
+			*mqd = (volatile void *) m;
 			*gart_addr = xcc_gart_addr;
 		}
 	}
@@ -751,7 +751,7 @@ static int destroy_mqd_v9_4_3(struct mqd_manager *mm, void *mqd,
 	uint32_t xcc_mask = mm->dev->xcc_mask;
 	int xcc_id, err, inst = 0;
 	void *xcc_mqd;
-	struct v9_mqd *m;
+	volatile struct v9_mqd *m;
 	uint64_t mqd_offset;
 
 	m = get_mqd(mqd);

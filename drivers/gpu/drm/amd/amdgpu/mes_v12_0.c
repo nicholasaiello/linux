@@ -780,7 +780,7 @@ static int mes_v12_0_allocate_ucode_buffer(struct amdgpu_device *adev,
 		return r;
 	}
 
-	memcpy(adev->mes.ucode_fw_ptr[pipe], fw_data, fw_size);
+	memcpy_toio(adev->mes.ucode_fw_ptr[pipe], fw_data, fw_size);
 
 	amdgpu_bo_kunmap(adev->mes.ucode_fw_obj[pipe]);
 	amdgpu_bo_unreserve(adev->mes.ucode_fw_obj[pipe]);
@@ -814,7 +814,7 @@ static int mes_v12_0_allocate_ucode_data_buffer(struct amdgpu_device *adev,
 		return r;
 	}
 
-	memcpy(adev->mes.data_fw_ptr[pipe], fw_data, fw_size);
+	memcpy_toio(adev->mes.data_fw_ptr[pipe], fw_data, fw_size);
 
 	amdgpu_bo_kunmap(adev->mes.data_fw_obj[pipe]);
 	amdgpu_bo_unreserve(adev->mes.data_fw_obj[pipe]);
@@ -987,7 +987,7 @@ static int mes_v12_0_allocate_eop_buf(struct amdgpu_device *adev,
 		return r;
 	}
 
-	memset(eop, 0,
+	memset_io(eop, 0,
 	       adev->mes.eop_gpu_obj[pipe]->tbo.base.size);
 
 	amdgpu_bo_kunmap(adev->mes.eop_gpu_obj[pipe]);
@@ -998,7 +998,7 @@ static int mes_v12_0_allocate_eop_buf(struct amdgpu_device *adev,
 
 static int mes_v12_0_mqd_init(struct amdgpu_ring *ring)
 {
-	struct v12_compute_mqd *mqd = ring->mqd_ptr;
+	volatile struct v12_compute_mqd *mqd = ring->mqd_ptr;
 	uint64_t hqd_gpu_addr, wb_gpu_addr, eop_base_addr;
 	uint32_t tmp;
 
@@ -1107,7 +1107,7 @@ static int mes_v12_0_mqd_init(struct amdgpu_ring *ring)
 
 static void mes_v12_0_queue_init_register(struct amdgpu_ring *ring)
 {
-	struct v12_compute_mqd *mqd = ring->mqd_ptr;
+	volatile struct v12_compute_mqd *mqd = ring->mqd_ptr;
 	struct amdgpu_device *adev = ring->adev;
 	uint32_t data = 0;
 
@@ -1314,7 +1314,7 @@ static int mes_v12_0_mqd_sw_init(struct amdgpu_device *adev,
 		return r;
 	}
 
-	memset(ring->mqd_ptr, 0, mqd_size);
+	memset_io(ring->mqd_ptr, 0, mqd_size);
 
 	/* prepare MQD backup */
 	adev->mes.mqd_backup[pipe] = kmalloc(mqd_size, GFP_KERNEL);
