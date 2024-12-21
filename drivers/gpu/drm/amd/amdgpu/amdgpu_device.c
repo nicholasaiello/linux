@@ -1486,7 +1486,7 @@ static int amdgpu_device_wb_init(struct amdgpu_device *adev)
 		memset(&adev->wb.used, 0, sizeof(adev->wb.used));
 
 		/* clear wb memory */
-		memset((char *)adev->wb.wb, 0, AMDGPU_MAX_WB * sizeof(uint32_t) * 8);
+		memset_io((char *)adev->wb.wb, 0, AMDGPU_MAX_WB * sizeof(uint32_t) * 8);
 	}
 
 	return 0;
@@ -4692,7 +4692,8 @@ void amdgpu_device_fini_sw(struct amdgpu_device *adev)
 		vga_client_unregister(adev->pdev);
 
 	if (drm_dev_enter(adev_to_drm(adev), &idx)) {
-
+		// TODO: this crashes w/ the RT kernel (NA)
+		amdgpu_doorbell_fini(adev);
 		iounmap(adev->rmmio);
 		adev->rmmio = NULL;
 		drm_dev_exit(idx);
