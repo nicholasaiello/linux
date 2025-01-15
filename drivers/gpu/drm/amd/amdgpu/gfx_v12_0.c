@@ -457,7 +457,7 @@ static int gfx_v12_0_ring_test_ib(struct amdgpu_ring *ring, long timeout)
 	    ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
 		return 0;
 
-	memset(&ib, 0, sizeof(ib));
+	memset_io(&ib, 0, sizeof(ib));
 
 	if (ring->is_mes_queue) {
 		uint32_t padding, offset;
@@ -764,7 +764,7 @@ static int gfx_v12_0_mec_init(struct amdgpu_device *adev)
 			return r;
 		}
 
-		memset(hpd, 0, mec_hpd_size);
+		memset_io(hpd, 0, mec_hpd_size);
 
 		amdgpu_bo_kunmap(adev->gfx.mec.hpd_eop_obj);
 		amdgpu_bo_unreserve(adev->gfx.mec.hpd_eop_obj);
@@ -1047,10 +1047,10 @@ static void gfx_v12_0_rlc_backdoor_autoload_copy_ucode(struct amdgpu_device *ade
 	if (fw_size > toc_fw_size)
 		fw_size = toc_fw_size;
 
-	memcpy(ptr + toc_offset, fw_data, fw_size);
+	memcpy_toio(ptr + toc_offset, fw_data, fw_size);
 
 	if (fw_size < toc_fw_size)
-		memset(ptr + toc_offset + fw_size, 0, toc_fw_size - fw_size);
+		memset_io(ptr + toc_offset + fw_size, 0, toc_fw_size - fw_size);
 }
 
 static void
@@ -2927,7 +2927,7 @@ static int gfx_v12_0_kgq_init_queue(struct amdgpu_ring *ring, bool reset)
 	int mqd_idx = ring - &adev->gfx.gfx_ring[0];
 
 	if (!reset && !amdgpu_in_reset(adev) && !adev->in_suspend) {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		memset_io((void *)mqd, 0, sizeof(*mqd));
 		mutex_lock(&adev->srbm_mutex);
 		soc24_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		amdgpu_ring_init_mqd(ring);
@@ -3237,7 +3237,7 @@ static int gfx_v12_0_kiq_init_queue(struct amdgpu_ring *ring)
 	if (amdgpu_in_reset(adev)) { /* for GPU_RESET case */
 		/* reset MQD to a clean status */
 		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(*mqd));
+			memcpy_toio(mqd, adev->gfx.mec.mqd_backup[mqd_idx], sizeof(*mqd));
 
 		/* reset ring buffer */
 		ring->wptr = 0;
@@ -3249,7 +3249,7 @@ static int gfx_v12_0_kiq_init_queue(struct amdgpu_ring *ring)
 		soc24_grbm_select(adev, 0, 0, 0, 0);
 		mutex_unlock(&adev->srbm_mutex);
 	} else {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		memset_io((void *)mqd, 0, sizeof(*mqd));
 		if (amdgpu_sriov_vf(adev) && adev->in_suspend)
 			amdgpu_ring_clear_ring(ring);
 		mutex_lock(&adev->srbm_mutex);
@@ -3260,7 +3260,7 @@ static int gfx_v12_0_kiq_init_queue(struct amdgpu_ring *ring)
 		mutex_unlock(&adev->srbm_mutex);
 
 		if (adev->gfx.mec.mqd_backup[mqd_idx])
-			memcpy(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(*mqd));
+			memcpy_fromio(adev->gfx.mec.mqd_backup[mqd_idx], mqd, sizeof(*mqd));
 	}
 
 	return 0;
@@ -3273,7 +3273,7 @@ static int gfx_v12_0_kcq_init_queue(struct amdgpu_ring *ring, bool reset)
 	int mqd_idx = ring - &adev->gfx.compute_ring[0];
 
 	if (!reset && !amdgpu_in_reset(adev) && !adev->in_suspend) {
-		memset((void *)mqd, 0, sizeof(*mqd));
+		memset_io((void *)mqd, 0, sizeof(*mqd));
 		mutex_lock(&adev->srbm_mutex);
 		soc24_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 		amdgpu_ring_init_mqd(ring);

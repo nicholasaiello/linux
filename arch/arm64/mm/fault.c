@@ -26,6 +26,7 @@
 #include <linux/pkeys.h>
 #include <linux/preempt.h>
 #include <linux/hugetlb.h>
+#include <linux/nmi.h>
 
 #include <asm/acpi.h>
 #include <asm/bug.h>
@@ -697,6 +698,7 @@ bad_area:
 		 * We had some memory, but were unable to successfully fix up
 		 * this page fault.
 		 */
+		printk("Page fault bus error\n");
 		arm64_force_sig_fault(SIGBUS, BUS_ADRERR, far, inf->name);
 	} else if (fault & (VM_FAULT_HWPOISON_LARGE | VM_FAULT_HWPOISON)) {
 		unsigned int lsb;
@@ -750,8 +752,17 @@ static int do_alignment_fault(unsigned long far, unsigned long esr,
 			      struct pt_regs *regs)
 {
 	if (IS_ENABLED(CONFIG_COMPAT_ALIGNMENT_FIXUPS) &&
-	    compat_user_mode(regs))
+		compat_user_mode(regs))
 		return do_compat_alignment_fixup(far, regs);
+
+	if (IS_ENABLED(CONFIG_ARM64_ALIGNMENT_FIXUPS) && user_mode(regs)) {
+		// aarch64 user mode
+		if (do_alignment_fixup(far, regs) == 0)
+			return 0;
+
+		printk("Unfixed alignment issue\n");
+	}
+
 	do_bad_area(far, esr, regs);
 	return 0;
 }
