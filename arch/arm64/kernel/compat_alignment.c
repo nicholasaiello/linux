@@ -318,7 +318,6 @@ int do_compat_alignment_fixup(unsigned long addr, struct pt_regs *regs)
 	int thumb2_32b = 0;
 
 	instrptr = instruction_pointer(regs);
-
 	if (compat_thumb_mode(regs)) {
 		__le16 __user *ptr = (__le16 __user *)(instrptr & ~1);
 		u16 tinstr, tinst2;

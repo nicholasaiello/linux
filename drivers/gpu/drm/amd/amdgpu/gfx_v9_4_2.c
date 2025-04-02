@@ -503,14 +503,14 @@ static int gfx_v9_4_2_do_sgprs_init(struct amdgpu_device *adev)
 		return 0;
 
 	/* allocate the write-back buffer from IB */
-	memset(&wb_ib, 0, sizeof(wb_ib));
+	memset_io(&wb_ib, 0, sizeof(wb_ib));
 	r = amdgpu_ib_get(adev, NULL, (1 + wb_size) * sizeof(uint32_t),
 			  AMDGPU_IB_POOL_DIRECT, &wb_ib);
 	if (r) {
 		dev_err(adev->dev, "failed to get ib (%d) for wb\n", r);
 		return r;
 	}
-	memset(wb_ib.ptr, 0, (1 + wb_size) * sizeof(uint32_t));
+	memset_io(wb_ib.ptr, 0, (1 + wb_size) * sizeof(uint32_t));
 
 	r = gfx_v9_4_2_run_shader(adev,
 			&adev->gfx.compute_ring[0],
