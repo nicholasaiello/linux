@@ -1,4 +1,3 @@
-
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/timekeeping.h>
@@ -10,957 +9,642 @@
 #include <asm/simd.h>
 #include <asm/ptrace.h>
 #include <asm/traps.h>
+#include <asm/cacheflush.h>
+#include <asm/barrier.h>
 
 #include <generated/asm/sysreg-defs.h>
 
 /*
- *Happens with The Long Dark (also with steam)
- *
- *[ 6012.660803] Faulting instruction: 0x3d800020
-[ 6012.660813] Load/Store: op0 0x3 op1 0x1 op2 0x3 op3 0x0 op4 0x0
- *
- *[  555.449651] Load/Store: op0 0x3 op1 0x1 op2 0x1 op3 0x1 op4 0x0
-[  555.449654] Faulting instruction: 0x3c810021
- *
- *
- *[  555.449663] Load/Store: op0 0x3 op1 0x1 op2 0x1 op3 0x2 op4 0x0
-[  555.449666] Faulting instruction: 0x3c820020
- *
- *[  555.449674] Load/Store: op0 0x3 op1 0x1 op2 0x1 op3 0x3 op4 0x0
-[  555.449677] Faulting instruction: 0x3c830021
-
-stur	q1, [x1, #16]
-potentially also ldur	q0, [x1, #32] and ldur	q1, [x1, #48]
- *
- *
- *
+ * ARM64 Alignment Fault Handler - Optimized for ARM64 SBCs
+ * 
+ * Optimizations for Raspberry Pi 5 and similar ARM64 platforms:
+ * - Cache-friendly memory access patterns
+ * - Reduced function call overhead with inlining
+ * - Optimized SIMD operations with batch processing
+ * - ARM64-native bit manipulation operations
+ * - Efficient branch prediction hints
+ * - Streamlined error paths
  */
 
-
-struct fixupDescription {
-	void *addr;
-
-	// datax_simd has to be located directly after datax in memory
-	// u64 data1;
-	// u64 data1_simd;
-	// u64 data2;
-	// u64 data2_simd;
-
-	int reg1;
-	int reg2;
-
-	int Rs;		// used for atomics (which don't get handled atomically)
-
-	int simd;	// whether or not this is a vector instruction
-	int load;	// 1 is it's a load, 0 if it's a store
-	int pair;	// 1 if it's a l/s pair instruction
-	int width;	// width of the access in bits
-	int extendSign;
-	int extend_width;
-
-	// profiling
-	u64 starttime;
-	u64 decodedtime;
-	u64 endtime;
+/* Fault descriptor optimized for cache efficiency */
+struct fault_desc {
+	void __user *addr;       /* Target memory address */
+	u32 instr;              /* Faulting instruction */
+	
+	/* Register information - packed for cache efficiency */
+	u8 reg1;                /* Primary target register */
+	u8 reg2;                /* Secondary register (for pairs) */
+	u8 base_reg;            /* Base address register */
+	u8 offset_reg;          /* Offset register (register addressing) */
+	
+	/* Operation parameters */
+	u16 width_bits;         /* Access width in bits */
+	u16 extend_width;       /* Sign extension target width */
+	s16 immediate;          /* Immediate offset value */
+	
+	/* Flags - packed into single byte for cache efficiency */
+	u8 is_load:1;           /* 1=load, 0=store */
+	u8 is_simd:1;           /* SIMD/vector operation */
+	u8 is_pair:1;           /* Load/store pair */
+	u8 sign_extend:1;       /* Sign extend on load */
+	u8 scale_offset:1;      /* Scale offset by access size */
+	u8 post_index:1;        /* Post-increment addressing */
+	u8 pre_index:1;         /* Pre-increment addressing */
+	u8 reserved:1;          /* Reserved for future use */
 };
 
-static __always_inline int alignment_get_arm64(struct pt_regs *regs, __le64 __user *ip, u32 *inst)
+/* ARM64-optimized instruction fetch */
+static __always_inline int get_fault_instruction(struct pt_regs *regs, u32 *instr)
 {
-	__le32 instr = 0;
-	int fault;
-
-	fault = get_user(instr, ip);
-	if (fault)
-		return fault;
-
-	*inst = __le32_to_cpu(instr);
+	__le32 le_instr;
+	int ret = get_user(le_instr, (__le32 __user *)instruction_pointer(regs));
+	if (unlikely(ret))
+		return ret;
+	*instr = __le32_to_cpu(le_instr);
 	return 0;
 }
 
-__always_inline int64_t extend_sign(int64_t in, int bits)
+/* Sign extension helper - optimized for common cases */
+static __always_inline s64 sign_extend_imm(u64 value, unsigned int bits)
 {
-	bits--;
-	if (in & (1 << bits)) {
-		// extend sign
-		return (0xffffffffffffffff << bits) | in;
+	if (unlikely(bits == 0 || bits > 64))
+		return 0;
+	
+	if (likely(bits <= 32)) {
+		u32 mask = (1U << (bits - 1));
+		return (s32)((value ^ mask) - mask);
 	}
-	return in;
+
+	u64 mask = (1ULL << (bits - 1));
+	return (s64)((value ^ mask) - mask);
 }
 
-// saves the contents of the simd register reg to dst
-__always_inline void read_simd_reg(int reg, u64 dst[2])
+/* Optimized SIMD access with reduced kernel_neon overhead */
+static __always_inline int simd_access_reg(u8 reg, u64 data[2], bool write)
 {
-	struct user_fpsimd_state st = {0};
-	//fpsimd_save_state(&st);
-
-	if (!may_use_simd())
-		printk("may_use_simd returned false!\n");
+	if (unlikely(!may_use_simd() || reg >= 32))
+		return -EINVAL;
 
 	kernel_neon_begin();
-	if (current->thread.sve_state)
-		printk("SVE state is not NULL!\n");
-
-	dst[0] = *((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg]));
-	dst[1] = *(((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg])) + 1);
-
-	kernel_neon_end();
-}
-
-// TODO: read from two registers (NA)
-__always_inline void read_simd_regs(int reg1, int reg2, u64 dst1[2], u64 dst2[2])
-{
-	if (!may_use_simd())
-		printk("may_use_simd returned false!\n");
-
-	kernel_neon_begin();
-	if (current->thread.sve_state)
-		printk("SVE state is not NULL!\n");
-
-	dst1[0] = *((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg1]));
-	dst1[1] = *(((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg1])) + 1);
-
-	dst2[0] = *((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg2]));
-	dst2[1] = *(((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg2])) + 1);
-
-	kernel_neon_end();
-}
-
-
-__always_inline void write_simd_reg(int reg, u64 src[2])
-{
-	if (!may_use_simd())
-		printk("may_use_simd returned false!\n");
-
-	kernel_neon_begin();
-	if (current->thread.sve_state)
-		printk("SVE state is not NULL!\n");
-
-	*((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg])) = src[0];
-	*(((u64 *)(&current->thread.uw.fpsimd_state.vregs[reg])) + 1) = src[1];
-
-	kernel_neon_end();
-}
-
-// these try to use larger access widths than single bytes. Slower for small loads/stores, but it might speed larger ones up
-
-__always_inline int put_data2(int size, uint8_t *data, void *addr)
-{
-	int r = 0;
-
-	while (size) {
-		if (size >= 4 && (((u64)addr % 4) == 0)) {
-			if ((r=put_user( (*(((uint32_t *)(data)))), (uint32_t __user *)addr)))
-				return r;
-
-			addr += 4;
-			data += 4;
-			size -= 4;
-			continue;
-		}
-		if (size >= 2 && (((u64)addr % 2) == 0)) {
-			if ((r=put_user( (*(((uint16_t *)(data)))), (uint16_t __user *)addr)))
-				return r;
-
-			addr += 2;
-			data += 2;
-			size -= 2;
-			continue;
-		}
-		// I guess the if is redundant here
-		if (size >= 1) {
-			if ((r=put_user( (*(((uint8_t *)(data)))), (uint8_t __user *)addr)))
-				return r;
-
-			addr += 1;
-			data += 1;
-			size -= 1;
-			continue;
-		}
-
-	}
-
-	return r;
-}
-
-__always_inline int get_data2(int size, uint8_t *data, void *addr)
-{
-	int r = 0;
-	uint32_t val32;
-	uint16_t val16;
-	uint8_t val8;
-	while (size) {
-		if (size >= 4 && (((u64)addr % 4) == 0)) {
-			if ((r=get_user( val32, (uint32_t __user *)addr)))
-				return r;
-
-			*((uint32_t *)data) = val32;
-			addr += 4;
-			data += 4;
-			size -= 4;
-			continue;
-		}
-		if (size >= 2 && (((u64)addr % 2) == 0)) {
-			if ((r=get_user( val16, (uint16_t __user *)addr)))
-				return r;
-
-			*((uint16_t *)data) = val16;
-			addr += 2;
-			data += 2;
-			size -= 2;
-			continue;
-		}
-		// I guess the if is redundant here
-		if (size >= 1) {
-			if ((r=get_user( val8, (uint8_t __user *)addr)))
-				return r;
-
-			*((uint8_t *)data) = val8;
-			addr += 1;
-			data += 1;
-			size -= 1;
-			continue;
-		}
-
-	}
-
-	return r;
-}
-
-
-// these should avoid some branching, but still use single byte accesses
-__always_inline int put_data(int size, uint8_t *data, void *addr)
-{
-	int r = 0;
-	int addrIt = 0;
-
-	// with the fixed size loops, the compiler should be able to unroll them
-	// this should mean a lot less branching
-	switch(size) {
-	case 16:
-		for (int i = 0; i < 8; i++) {
-			if ((r=put_user( (*(((uint8_t *)(data)) + addrIt) & 0xff), (uint8_t __user *)addr)))
-				return r;
-
-			addrIt++;
-			addr++;
-		}
-		//__attribute__((fallthrough));
-	case 8:
-		for (int i = 0; i < 4; i++) {
-			if ((r=put_user( (*(data + addrIt) & 0xff), (uint8_t __user *)addr)))
-				return r;
-
-			addrIt++;
-			addr++;
-		}
-		//__attribute__((fallthrough));
-	case 4:
-		for (int i = 0; i < 2; i++) {
-			if ((r=put_user( (*(data + addrIt) & 0xff), (uint8_t __user *)addr)))
-				return r;
-
-			addrIt++;
-			addr++;
-		}
-		//__attribute__ ((fallthrough));
-	case 2:
-		if ((r=put_user( (*(data + addrIt) & 0xff), (uint8_t __user *)addr)))
-			return r;
-
-		addrIt++;
-		addr++;
-		//__attribute__ ((fallthrough));
-	case 1:
-		if ((r=put_user( (*(data + addrIt) & 0xff), (uint8_t __user *)addr)))
-			return r;
-
-		addrIt++;
-		addr++;
-		break;
-	default:
-		printk("unsupported size %d\n", size);
-	}
-
-	return r;
-}
-
-__always_inline int get_data(int size, uint8_t *data, void *addr)
-{
-	int r = 0;
-	int addrIt = 0;
-
-	// with the fixed size loops, the compiler should be able to unroll them
-	// this should mean a lot less branching
-	uint8_t val;
-	switch(size) {
-	case 16:
-		for (int i = 0; i < 8; i++) {
-			if ((r=get_user( val, (uint8_t __user *)addr)))
-				return r;
-
-			*(data + addrIt) = val;
-			addrIt++;
-			addr++;
-		}
-		// fall through
-	case 8:
-		for (int i = 0; i < 4; i++) {
-			if ((r=get_user( val, (uint8_t __user *)addr)))
-				return r;
-
-			*(data + addrIt) = val;
-			addrIt++;
-			addr++;
-		}
-		// fall through
-	case 4:
-		for (int i = 0; i < 2; i++) {
-			if ((r=get_user( val, (uint8_t __user *)addr)))
-				return r;
-
-			*(data + addrIt) = val;
-			addrIt++;
-			addr++;
-		}
-		// fall through
-	case 2:
-		if ((r=get_user( val, (uint8_t __user *)addr)))
-			return r;
-
-		*(data + addrIt) = val;
-		addrIt++;
-		addr++;
-		// fall through
-	case 1:
-		if ((r=get_user( val, (uint8_t __user *)addr)))
-			return r;
-
-		*(data + addrIt) = val;
-		addrIt++;
-		addr++;
-		break;
-	default:
-		printk("unsupported size %d\n", size);
-	}
-
-	return r;
-}
-
-int memset_io_user(uint64_t size, uint8_t c, void *addr)
-{
-	int r = 0;
-	uint64_t pattern = c;
-	pattern |= pattern << 8;
-	pattern |= pattern << 16;
-	pattern |= pattern << 32;
-	uint64_t cnt = 0;
-	while (cnt < size) {
-		if ((uint64_t)(addr + cnt) % 8) {
-			if ((r = put_user(c, (uint8_t __user *) addr)))
-				return r;
-
-			cnt++;
-		} else if (size - cnt >= 8) {
-			if ((r = put_user(pattern, (uint64_t __user *) addr)))
-				return r;
-
-			cnt += 8;
-		} else {
-			if ((r = put_user(c, (uint8_t __user *) addr)))
-				return r;
-
-			cnt++;
-		}
-
-	}
-	return r;
-}
-
-int do_ls_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	int r;
-	u64 data1[2] = {0,0};
-	u64 data2[2] = {0,0};
-	//desc->decodedtime = ktime_get_ns();
-	// the reg indices have to always be valid, even if the reg isn't being used
-	if (!desc->load) {
-		if (desc->simd) {
-			// At least currently, there aren't any simd instructions supported that use more than one data register
-			//__uint128_t tmp;
-
-			// TODO: read both registers at once (NA)
-			read_simd_regs(desc->reg1, desc->reg2, data1, data2);
-			// probably better for performance to read both registers with one function to kernel_neon_* doesn't have to be called more than once
-			// read_simd_reg(desc->reg2, data2);
-			//data1[0] = tmp;
-			//data1[1] = *(((u64*)&tmp) + 1);
-			///printk("SIMD: storing 0x%llx %llx (%d bits) at 0x%px", data1[1], data1[0], desc->width, desc->addr);
-			/*if (desc->width < 128) {
-				return -1;
-			}*/
-		} else {
-			data1[0] = regs->regs[desc->reg1];
-			data2[0] = regs->regs[desc->reg2];
-		}
-	}
-
-	/*if (desc->width > 64) {
-		printk("Currently cannot process ls_fixup with a size of %d bits\n", desc->width);
-		return 1;
-	}*/
-	if (!desc->load) {
-		uint8_t *addr = desc->addr;
-		int bcount = desc->width / 8;	// since the field stores the width in bits. Honestly, there's no particular reason for that
-
-		//printk("Storing %d bytes (pair: %d) to 0x%llx",bcount, desc->pair, desc->addr);
-		int addrIt = 0;
-		for (int i = 0; i < bcount; i++) {
-			if ((r=put_user( (*(((uint8_t *)(data1)) + addrIt) & 0xff), (uint8_t __user *)addr)))
-				return r;
-
-			//desc->data1 >>= 8;
-			addrIt++;
-			addr++;
-		}
-		//put_data2(bcount, (uint8_t*)data1, addr);
-		//addr += bcount;
-		addrIt = 0;
-		if (desc->pair) {
-			for (int i = 0; i < bcount; i++) {
-				if ((r=put_user((*(((uint8_t *)(data2)) + addrIt) & 0xff) & 0xff, (uint8_t __user *)addr)))
-					return r;
-
-				//desc->data2 >>= 8;
-				addrIt++;
-				addr++;
-			}
-			//put_data2(bcount, (uint8_t*)data2, addr);
-			addr += bcount;
-		}
-		arm64_skip_faulting_instruction(regs, 4);
+	
+	struct user_fpsimd_state *fpsimd = &current->thread.uw.fpsimd_state;
+	__uint128_t *vreg = (__uint128_t *)&fpsimd->vregs[reg];
+	
+	if (write) {
+		*vreg = ((__uint128_t)data[1] << 64) | data[0];
 	} else {
-		//printk("Loading is currently not implemented (addr 0x%px)\n", desc->addr);
-
-		uint8_t *addr = desc->addr;
-		int bcount = desc->width / 8;	// since the field stores the width in bits. Honestly, there's no particular reason for that
-
-		//printk("Storing %d bytes (pair: %d) to 0x%llx",bcount, desc->pair, desc->addr);
-		int addrIt = 0;
-		/*for (int i = 0; i < bcount; i++) {
-			uint8_t val;
-			if ((r=get_user( val, (uint8_t __user *)addr))) {
-				printk("Failed to write data at 0x%px (base was 0x%px)\n", addr, desc->addr);
-				return r;
-			}
-			*(((uint8_t*)data1) + addrIt) = val;
-			//desc->data1 >>= 8;
-			addrIt++;
-			addr++;
-		}*/
-		get_data2(bcount, (uint8_t *)data1, addr);
-		addr += bcount;
-
-		if (desc->simd) {
-			write_simd_reg(desc->reg1, data1);
-		} else {
-			regs->regs[desc->reg1] = data1[0];
-		}
-
-		addrIt = 0;
-		if (desc->pair) {
-			/*for (int i = 0; i < bcount; i++) {
-				uint8_t val;
-				if ((r=get_user(val, (uint8_t __user *)addr))) {
-					printk("Failed to write data at 0x%px (base was 0x%px)\n", addr, desc->addr);
-					return r;
-				}
-				*(((uint8_t*)data2) + addrIt) = val;
-				//desc->data2 >>= 8;
-				addrIt++;
-				addr++;
-			}*/
-
-			get_data2(bcount, (uint8_t *)data2, addr);
-			addr += bcount;
-			if (desc->simd) {
-				write_simd_reg(desc->reg2, data1);
-			} else {
-				regs->regs[desc->reg2] = data1[0];
-			}
-		}
-		arm64_skip_faulting_instruction(regs, 4);
+		__uint128_t reg_value = *vreg;
+		data[0] = (u64)reg_value;
+		data[1] = (u64)(reg_value >> 64);
 	}
+
+	kernel_neon_end();
 	return 0;
 }
 
-int ls_cas_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
+/* Batch SIMD operations for pairs - reduces kernel_neon overhead */
+static __always_inline int simd_access_pair(u8 reg1, u8 reg2, u64 data1[2], u64 data2[2], bool write)
 {
-	uint8_t size = (instr >> 30) & 3;
-	uint8_t load = (instr >> 22) & 1;	// acquire semantics, has no effect here, since it's not atomic anymore
-	uint8_t Rs = (instr >> 16) & 0x1f;
-	uint8_t Rt2 = (instr >> 10) & 0x1f;
-	uint8_t Rn = (instr >> 5) & 0x1f;
-	uint8_t Rt = instr & 0x1f;
+	if (unlikely(!may_use_simd() || reg1 >= 32 || reg2 >= 32))
+		return -EINVAL;
 
-	uint8_t o0 = (instr >> 15) & 1;	// L, release semantics, has no effect here, since it's not atomic anymore
-
-	if (Rt2 != 0x1f)
-		return -1;
-
-	switch(size) {
-	case 0:
-		desc->width = 8;
-		break;
-	case 1:
-		desc->width = 16;
-		break;
-	case 2:
-		desc->width = 32;
-		break;
-	case 3:
-		desc->width = 64;
-		break;
+	kernel_neon_begin();
+	
+	struct user_fpsimd_state *fpsimd = &current->thread.uw.fpsimd_state;
+	__uint128_t *vregs = (__uint128_t *)fpsimd->vregs;
+	
+	if (write) {
+		vregs[reg1] = ((__uint128_t)data1[1] << 64) | data1[0];
+		vregs[reg2] = ((__uint128_t)data2[1] << 64) | data2[0];
+	} else {
+		__uint128_t reg1_value = vregs[reg1];
+		__uint128_t reg2_value = vregs[reg2];
+		
+		data1[0] = (u64)reg1_value;
+		data1[1] = (u64)(reg1_value >> 64);
+		data2[0] = (u64)reg2_value;
+		data2[1] = (u64)(reg2_value >> 64);
 	}
 
-	desc->addr = (void *)regs->regs[Rn];
-	u64 data1 = regs->regs[Rt];
+	kernel_neon_end();
+	return 0;
+}
 
-	// nearly everything from here on could be moved into another function if needed
-	u64 cmpmask = (1 << desc->width) - 1;
-	u64 cmpval = regs->regs[Rs] & cmpmask;
+/* Unified memory transfer optimized for ARM64 cache line efficiency */
+static __always_inline int transfer_data(void __user *addr, u8 *data, unsigned int size, bool to_user)
+{
+	unsigned int remaining = size;
 
-	u64 readval = 0;
-	int bcount = desc->width / 8;
-	u64 addr = desc->addr;
-	int r;
-	uint8_t  tmp;
+	if (unlikely(size == 0 || size > 16))
+		return -EINVAL;
+	
+	/* ARM64 prefers 64-bit aligned accesses - optimize for cache lines */
+	while (remaining >= 8 && IS_ALIGNED((unsigned long)addr, 8)) {
+		int ret = to_user ? 
+			put_user(*(u64 *)data, (u64 __user *)addr) :
+			get_user(*(u64 *)data, (u64 __user *)addr);
+		if (unlikely(ret))
+			return ret;
+		data += 8;
+		addr += 8;
+		remaining -= 8;
+	}
+	
+	/* 32-bit accesses for remainder */
+	while (remaining >= 4 && IS_ALIGNED((unsigned long)addr, 4)) {
+		int ret = to_user ?
+			put_user(*(u32 *)data, (u32 __user *)addr) :
+			get_user(*(u32 *)data, (u32 __user *)addr);
+		if (unlikely(ret))
+			return ret;
+		data += 4;
+		addr += 4;
+		remaining -= 4;
+	}
 
-	printk("Atomic CAS not being done atomically at 0x%px, size %d\n", desc->addr, desc->width);
-
-	for (int i = 0; i < bcount; i++) {
-		if ((r=get_user(tmp, (uint8_t __user *)addr)))
-			return r;
-		readval |= tmp;
-		readval <<= 8;	// maybe this could be read directly into regs->regs[Rs]
+	/* 16-bit accesses */
+	while (remaining >= 2 && IS_ALIGNED((unsigned long)addr, 2)) {
+		int ret = to_user ?
+			put_user(*(u16 *)data, (u16 __user *)addr) :
+			get_user(*(u16 *)data, (u16 __user *)addr);
+		if (unlikely(ret))
+			return ret;
+		data += 2;
+		addr += 2;
+		remaining -= 2;
+	}
+	
+	/* Handle remaining bytes */
+	while (remaining > 0) {
+		int ret = to_user ?
+			put_user(*data, (u8 __user *)addr) :
+			get_user(*data, (u8 __user *)addr);
+		if (unlikely(ret))
+			return ret;
+		data++;
 		addr++;
+		remaining--;
 	}
+	
+	return 0;
+}
 
-	if ((readval & cmpmask) == cmpval) {
-		// swap
-		addr = (u64)desc->addr;
+/* ARM64-optimized block clear using 64-bit stores */
+static int clear_user_block(void __user *addr, u64 size)
+{
+	u64 remaining = size;
+	const u64 zero = 0;
+	
+	/* Use 64-bit writes for optimal ARM64 cache line utilization */
+	while (remaining >= 8) {
+		if (put_user(zero, (u64 __user *)addr))
+			return -EFAULT;
+		addr += 8;
+		remaining -= 8;
+	}
+	
+	/* Handle remaining bytes */
+	while (remaining > 0) {
+		if (put_user(0, (u8 __user *)addr))
+			return -EFAULT;
+		addr++;
+		remaining--;
+	}
+	
+	return 0;
+}
 
-		for (int i = 0; i < bcount; i++) {
-			if ((r=put_user(data1 & 0xff, (uint8_t __user *)addr)))
-				return r;
-			data1 >>= 8;
-			addr++;
+/* Extended register computation for register offset addressing */
+static __always_inline u64 compute_extended_offset(u64 reg_val, u8 extend_type, u8 shift)
+{
+	u64 result;
+	bool is_signed = (extend_type & 0x4) != 0;
+	bool is_64bit = (extend_type & 0x1) != 0;
+	
+	if (likely(!is_signed)) {
+		/* Zero extension */
+		result = is_64bit ? reg_val : (reg_val & 0xFFFFFFFF);
+	} else {
+		/* Sign extension */
+		if (is_64bit) {
+			result = reg_val;  /* Already 64-bit */
+		} else {
+			/* Sign extend from 32-bit */
+			result = (u64)(s64)(s32)(reg_val & 0xFFFFFFFF);
+		}
+	}
+	
+	return result << shift;
+}
+
+/* Streamlined load/store execution with optimized error paths */
+static int execute_ls_operation(struct pt_regs *regs, const struct fault_desc *desc)
+{
+	int ret = 0;
+	u64 reg_data[2] = {0, 0};
+	u64 reg2_data[2] = {0, 0};
+	unsigned int byte_count = desc->width_bits >> 3;
+	
+	if (!desc->is_load) {
+		/* Store operation - read from registers */
+		if (desc->is_simd) {
+			ret = desc->is_pair ?
+				simd_access_pair(desc->reg1, desc->reg2, reg_data, reg2_data, false) :
+				simd_access_reg(desc->reg1, reg_data, false);
+			if (unlikely(ret))
+				return ret;
+		} else {
+			reg_data[0] = regs->regs[desc->reg1];
+			if (desc->is_pair)
+				reg2_data[0] = regs->regs[desc->reg2];
+		}
+		
+		/* Memory writes */
+		ret = transfer_data(desc->addr, (u8 *)reg_data, byte_count, true);
+		if (unlikely(ret))
+			return ret;
+
+		if (desc->is_pair) {
+			ret = transfer_data(desc->addr + byte_count, (u8 *)reg2_data, byte_count, true);
+			if (unlikely(ret))
+				return ret;
+		}
+	} else {
+		/* Load operation - read from memory */
+		ret = transfer_data(desc->addr, (u8 *)reg_data, byte_count, false);
+		if (unlikely(ret))
+			return ret;
+
+		if (desc->is_pair) {
+			ret = transfer_data(desc->addr + byte_count, (u8 *)reg2_data, byte_count, false);
+			if (unlikely(ret))
+				return ret;
 		}
 
-		regs->regs[Rs] = readval;
+		/* Handle sign extension for scalar loads */
+		if (desc->sign_extend && !desc->is_simd && desc->extend_width > desc->width_bits) {
+			u64 sign_bit = 1ULL << (desc->width_bits - 1);
+			if (reg_data[0] & sign_bit && desc->extend_width <= 64) {
+				u64 extend_mask = ~((1ULL << desc->width_bits) - 1);
+				reg_data[0] |= extend_mask;
+			}
+		}
+
+		/* Register writes */
+		if (desc->is_simd) {
+			ret = desc->is_pair ?
+				simd_access_pair(desc->reg1, desc->reg2, reg_data, reg2_data, true) :
+				simd_access_reg(desc->reg1, reg_data, true);
+			if (unlikely(ret))
+				return ret;
+		} else {
+			regs->regs[desc->reg1] = reg_data[0];
+			if (desc->is_pair)
+				regs->regs[desc->reg2] = reg2_data[0];
+		}
 	}
 
+	/* Handle address writeback for pre/post-indexed addressing */
+	if (desc->pre_index || desc->post_index) {
+		regs->regs[desc->base_reg] += desc->immediate;
+	}
+
+	arm64_skip_faulting_instruction(regs, 4);
+	return 0;
+}
+
+/* Load/store pair decoder - optimized addressing mode handling */
+static int decode_ls_pair(u32 instr, struct pt_regs *regs, struct fault_desc *desc)
+{
+	u8 opc = (instr >> 30) & 3;
+	u8 addressing = (instr >> 23) & 3;
+	u8 load = (instr >> 22) & 1;
+	u8 simd = (instr >> 26) & 1;
+	u16 imm7 = (instr >> 15) & 0x7f;
+	u8 Rt2 = (instr >> 10) & 0x1f;
+	u8 Rn = (instr >> 5) & 0x1f;
+	u8 Rt = instr & 0x1f;
+	
+	if (addressing > 3)
+		return -EINVAL;
+	
+	s64 offset = sign_extend_imm(imm7, 7);
+	
+	desc->is_load = load;
+	desc->is_simd = simd;
+	desc->is_pair = 1;
+	desc->reg1 = Rt;
+	desc->reg2 = Rt2;
+	desc->base_reg = Rn;
+	desc->immediate = offset;
+	desc->post_index = (addressing == 1);
+	desc->pre_index = (addressing == 3);
+
+	if (simd) {
+		desc->width_bits = 32 << opc;
+		offset <<= (2 + opc);  /* Scale by access size */
+	} else {
+		/* Scalar pairs */
+		switch (opc) {
+		case 0: desc->width_bits = 32; offset <<= 2; break;
+		case 2: desc->width_bits = 64; offset <<= 3; break;
+		default:
+			printk("Invalid scalar pair opc=%u in instr=0x%08x\n", opc, instr);
+			return -EINVAL;
+		}
+	}
+	
+	/* Address calculation with proper indexing */
+	desc->addr = (void __user *)(regs->regs[Rn] + 
+		(desc->pre_index ? offset : (desc->post_index ? 0 : offset)));
+	
+	return 0;
+}
+
+/* Load/store register with unsigned immediate decoder */
+static int decode_ls_unsigned_imm(u32 instr, struct pt_regs *regs, struct fault_desc *desc)
+{
+	u8 size = (instr >> 30) & 3;
+	u8 simd = (instr >> 26) & 1;
+	u8 opc = (instr >> 22) & 3;
+	u16 imm12 = (instr >> 10) & 0xfff;
+	u8 Rn = (instr >> 5) & 0x1f;
+	u8 Rt = instr & 0x1f;
+	
+	u8 load = opc & 1;
+	u8 width_shift;
+	
+	if (simd) {
+		width_shift = size | ((opc & 2) << 1);
+		/* Invalid size/opc combination for SIMD */
+		if ((size & 1) && (opc & 2))
+			return -EINVAL;
+		desc->sign_extend = 0;
+	} else {
+		width_shift = size;
+		desc->sign_extend = (opc & 2) >> 1;
+		desc->extend_width = desc->sign_extend ? 32 : 64;
+	}
+	
+	desc->is_load = load;
+	desc->is_simd = simd;
+	desc->is_pair = 0;
+	desc->width_bits = 8 << width_shift;
+	desc->reg1 = Rt;
+	desc->base_reg = Rn;
+	desc->addr = (void __user *)(regs->regs[Rn] + (imm12 << width_shift));
+	
+	return 0;
+}
+
+/* Load/store register offset decoder */
+static int decode_ls_reg_offset(u32 instr, struct pt_regs *regs, struct fault_desc *desc)
+{
+	u8 size = (instr >> 30) & 3;
+	u8 simd = (instr >> 26) & 1;
+	u8 opc = (instr >> 22) & 3;
+	u8 Rm = (instr >> 16) & 0x1f;
+	u8 extend_type = (instr >> 13) & 7;
+	u8 scale = (instr >> 12) & 1;
+	u8 Rn = (instr >> 5) & 0x1f;
+	u8 Rt = instr & 0x1f;
+	
+	u8 load = opc & 1;
+	u8 width_shift = simd ? (size | ((opc & 2) << 1)) : size;
+	u8 shift = scale ? width_shift : 0;
+	
+	desc->is_load = load;
+	desc->is_simd = simd;
+	desc->is_pair = 0;
+	desc->width_bits = 8 << width_shift;
+	desc->reg1 = Rt;
+	desc->base_reg = Rn;
+	desc->offset_reg = Rm;
+	desc->scale_offset = scale;
+	
+	if (!simd) {
+		desc->sign_extend = (opc & 2) >> 1;
+		desc->extend_width = desc->sign_extend ? 32 : 64;
+	}
+	
+	u64 offset = compute_extended_offset(regs->regs[Rm], extend_type, shift);
+	desc->addr = (void __user *)(regs->regs[Rn] + offset);
+	
+	return 0;
+}
+
+/* Load/store unscaled immediate decoder */
+static int decode_ls_unscaled_imm(u32 instr, struct pt_regs *regs, struct fault_desc *desc)
+{
+	u8 size = (instr >> 30) & 3;
+	u8 simd = (instr >> 26) & 1;
+	u8 opc = (instr >> 22) & 3;
+	u16 imm9 = (instr >> 12) & 0x1ff;
+	u8 Rn = (instr >> 5) & 0x1f;
+	u8 Rt = instr & 0x1f;
+	
+	s16 offset = sign_extend_imm(imm9, 9);
+	u8 load = opc & 1;
+	
+	desc->is_load = load;
+	desc->is_simd = simd;
+	desc->is_pair = 0;
+	desc->reg1 = Rt;
+	desc->base_reg = Rn;
+	desc->immediate = offset;
+	desc->addr = (void __user *)(regs->regs[Rn] + offset);
+	
+	if (simd) {
+		desc->width_bits = 8 << (size | ((opc & 2) << 1));
+		desc->sign_extend = 0;
+	} else {
+		desc->width_bits = 8 << size;
+		desc->sign_extend = (opc & 2) >> 1;
+		desc->extend_width = desc->sign_extend ? 32 : 64;
+	}
+	
+	return 0;
+}
+
+/* Compare-and-swap atomic operation handler */
+static int handle_cas_operation(u32 instr, struct pt_regs *regs)
+{
+	u8 size = (instr >> 30) & 3;
+	u8 Rs = (instr >> 16) & 0x1f;
+	u8 Rt2 = (instr >> 10) & 0x1f;
+	u8 Rn = (instr >> 5) & 0x1f;
+	u8 Rt = instr & 0x1f;
+	
+	if (Rt2 != 0x1f)  /* Must be single register CAS */
+		return -EINVAL;
+	
+	unsigned int width_bits = 8 << size;
+	unsigned int byte_count = width_bits >> 3;
+	void __user *addr = (void __user *)regs->regs[Rn];
+	u64 compare_val = regs->regs[Rs] & ((1ULL << width_bits) - 1);
+	u64 new_val = regs->regs[Rt] & ((1ULL << width_bits) - 1);
+	
+	/* Read current value */
+	u64 current_val = 0;
+	int ret = transfer_data(addr, (u8 *)&current_val, byte_count, false);
+	if (ret)
+		return ret;
+	
+	current_val &= (1ULL << width_bits) - 1;
+
+	printk("CAS operation not atomic at %px, size %d bits\n", addr, width_bits);
+	
+	if (current_val == compare_val) {
+		/* Values match, perform the swap */
+		ret = transfer_data(addr, (u8 *)&new_val, byte_count, true);
+		if (ret)
+			return ret;
+	}
+	
+	/* Always write back the original value that was read */
+	regs->regs[Rs] = current_val;
 	arm64_skip_faulting_instruction(regs, 4);
 
 	return 0;
 }
 
-__always_inline int ls_pair_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
+/* Optimized instruction classifier with ARM64-specific patterns */
+static int handle_ls_instruction(u32 instr, struct pt_regs *regs)
 {
-	uint8_t op2;
-	uint8_t opc;
-	op2 = (instr >> 23) & 3;
-	opc = (instr >> 30) & 3;
+	struct fault_desc desc = {0};
+	desc.instr = instr;
 
-	uint8_t load = (instr >> 22) & 1;
-	uint8_t simd = (instr >> 26) & 1;
-	uint16_t imm7 = (instr >> 15) & 0x7f;
-	uint8_t Rt2 = (instr >> 10) & 0x1f;
-	uint8_t Rn = (instr >> 5) & 0x1f;
-	uint8_t Rt = instr & 0x1f;
+	u8 op0 = (instr >> 28) & 0xf;
+	u8 op1 = (instr >> 26) & 1;
+	u8 op2 = (instr >> 23) & 3;
+	u8 op3 = (instr >> 16) & 0x3f;
+	u8 op4 = (instr >> 10) & 3;
+	int ret = -EINVAL;
 
-	int64_t imm = extend_sign(imm7, 7);
-	//int immshift = 0;
-	desc->load = load;
-	desc->simd = simd;
+	// TODO: remove after debugging
+	printk("Handling Load/Store instruction: op0=0x%x op1=0x%x op2=0x%x op3=0x%x op4=0x%x instr=0x%08x\n",
+	       op0, op1, op2, op3, op4, instr);
 
-	// opc controls the width
-	if (simd) {
-		desc->width = 32 << opc;
-		//immshift = 4 << opc;
-		imm <<= 2;
-		imm <<= opc;
-	} else {
-		switch(opc) {
-		case 0:
-			desc->width = 32;
-			imm <<= 2;
-			break;
-		case 2:
-			desc->width = 64;
-			imm <<= 3;
-			break;
-		default:
-			return -1;
+	/* Optimize for most common cases first - better branch prediction */
+	if (likely((op0 & 3) == 2)) {
+		/* Load/store pairs - most common for alignment faults */
+		ret = decode_ls_pair(instr, regs, &desc);
+		if (likely(!ret))
+			ret = execute_ls_operation(regs, &desc);
+	} else if ((op0 & 3) == 3 && (op2 & 2) == 2) {
+		/* Unsigned immediate - second most common */
+		ret = decode_ls_unsigned_imm(instr, regs, &desc);
+		if (likely(!ret))
+			ret = execute_ls_operation(regs, &desc);
+	} else if ((op0 & 3) == 3 && (op2 & 2) == 0 && (op3 & 0x20) == 0x20 && op4 == 2) {
+		/* Register offset */
+		ret = decode_ls_reg_offset(instr, regs, &desc);
+		if (likely(!ret))
+			ret = execute_ls_operation(regs, &desc);
+	} else if ((op0 & 3) == 3 && (op2 & 2) == 0 && (op3 & 0x20) == 0x00 && op4 == 0) {
+		/* Unscaled immediate - handles 0x3c80c03f pattern */
+		ret = decode_ls_unscaled_imm(instr, regs, &desc);
+		if (likely(!ret))
+			ret = execute_ls_operation(regs, &desc);
+	} else if ((op0 & 3) == 0 && op1 == 0 && op2 == 1 && (op3 & 0x20) == 0x20) {
+		/* Compare-and-swap */
+		ret = handle_cas_operation(instr, regs);
+	} else if (op0 == 0xf && op1 == 0 && op2 == 0 && op3 == 0 && op4 == 1) {
+		/* Handle 0xf8008404 pattern */
+		ret = decode_ls_reg_offset(instr, regs, &desc);
+		if (likely(!ret))
+			ret = execute_ls_operation(regs, &desc);
+	}
+
+	return ret;
+}
+
+/* System instruction handler - DC ZVA optimized for ARM64 cache architecture */
+static int handle_system_instruction(u32 instr, struct pt_regs *regs)
+{
+	u8 op1 = (instr >> 16) & 0x7;
+	u8 op2 = (instr >> 5) & 0x7;
+	u8 CRn = (instr >> 12) & 0xf;
+	u8 CRm = (instr >> 8) & 0xf;
+	bool L = (instr >> 21) & 1;
+	u8 Rt = instr & 0x1f;
+ 
+	if (!L && op1 == 0x3 && op2 == 1 && CRn == 0x7 && CRm == 4) {
+		/* DC ZVA - optimized for ARM64 cache line efficiency */
+		u64 dczid_el0 = read_sysreg_s(SYS_DCZID_EL0);
+
+		if (unlikely((dczid_el0 >> DCZID_EL0_DZP_SHIFT) & 1))
+			return -EINVAL;
+
+		u16 block_size = 4 << (dczid_el0 & 0xf);
+		void __user *addr = (void __user *)regs->regs[Rt];
+		void __user *aligned_addr = (void __user *)((unsigned long)addr & ~(block_size - 1));
+
+		int ret = clear_user_block(aligned_addr, block_size);
+		if (likely(!ret)) {
+			/* Memory barrier for cache coherency */
+			dsb(sy);
+			arm64_skip_faulting_instruction(regs, 4);
 		}
+
+		return ret;
 	}
-
-	// op2 controls the indexing
-	switch(op2) {
-	case 2:
-		// offset
-		desc->addr = (void *)(regs->regs[Rn] + imm);
-		break;
-	default:
-		return -1;
-	}
-	//desc->data1 = regs->regs[Rt];
-	//desc->data2 = regs->regs[Rt2];
-	desc->reg1 = Rt;
-	desc->reg2 = Rt2;
-
-	return do_ls_fixup(instr, regs, desc);
-
+	
+	return -EINVAL;
 }
 
-__always_inline int ls_reg_unsigned_imm(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
+/* Branch/Exception/System instruction classifier */
+static int handle_branch_except_system(u32 instr, struct pt_regs *regs)
 {
-	uint8_t size = (instr >> 30) & 3;
-	uint8_t simd = (instr >> 26) & 1;
-	uint8_t opc = (instr >> 22) & 3;
-	uint64_t imm12 = (instr >> 10) & 0xfff;
-	uint8_t Rn = (instr >> 5) & 0x1f;
-	uint8_t Rt = instr & 0x1f;
+	u8 op0 = (instr >> 29) & 0x7;
+	u32 op1 = (instr >> 5) & 0x1fffff;
 
-	uint8_t load = opc & 1;
-	uint8_t extend_sign = 0;// = ((opc & 2) >> 1 ) & !simd;
-	int width_shift = 0;
+	// TODO: remove after debugging
+	// printk("Handling Branch/Exception/System instruction: op0=0x%x op1=0x%x instr=0x%08x\n",
+	//        op0, op1, instr);
 
-	if (simd) {
-		extend_sign = 0;
-		width_shift = size | ((opc & 2) << 1);
-	} else {
-		extend_sign = ((opc & 2) >> 1 );
-		width_shift = size;
+	if (op0 == 0x6 && (op1 & 0x1ec000) == 0x84000) {
+		return handle_system_instruction(instr, regs);
 	}
-
-	///printk("size: %d simd: %d opc: %d imm12: 0x%x Rn: %d Rt: %d\n", size, simd, opc, imm12, Rn, Rt);
-	// when in simd mode, opc&2 is a third size bit. Otherwise, it's there for sign extension
-	//width_shift = (size | (((opc & 2) & (simd << 1)) << 1));
-	desc->width = 8 << width_shift;
-
-	if ((size & 1) && simd && (opc & 2))
-		return 1;
-
-	desc->load = load;
-	desc->reg1 = Rt;
-	desc->simd = simd;
-	desc->extendSign = extend_sign;
-	u64 addr = regs->regs[Rn];
-	desc->addr = addr + (imm12 << width_shift);
-
-	return do_ls_fixup(instr, regs, desc);
+	
+	// TODO: use `pr_info_ratelimited` after debugging
+	printk("Unhandled Branch/Exception/System: op0=0x%x op1=0x%x instr=0x%08x\n",
+			   op0, op1, instr);
+	return -EINVAL;
 }
 
-
-__always_inline u64 extend_reg(u64 reg, int type, int shift)
-{
-	uint8_t is_signed = (type & 4) >> 2;
-	uint8_t input_width = type & 1;
-
-	u64 tmp;
-
-	if (!is_signed) {
-		tmp = reg;
-	} else {
-		if (input_width == 0) {
-			// 32bit, needs to be extended to 64
-			// I hope the compiler just does this kind of automatically with these types
-			int32_t stmpw = reg;
-			int64_t stmpdw = stmpw;
-			tmp = (u64)stmpdw;
-		} else {
-			printk("Other branch I forgor about previously!\n");
-			tmp = reg;	// since the size stays the same, I don't think this makes a difference
-		}
-	}
-
-	///printk("extend_reg: reg 0x%lx out (before shift) 0x%lx signed: %x\n", reg, tmp, is_signed);
-
-	return tmp << shift;
-}
-
-__always_inline int lsr_offset_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	uint8_t size = (instr >> 30) & 3;
-	uint8_t simd = (instr >> 26) & 1;
-	uint8_t opc = (instr >> 22) & 3;
-	uint8_t option = (instr >> 13) & 5;
-	uint8_t Rm = (instr >> 16) & 0x1f;
-	uint8_t Rn = (instr >> 5) & 0x1f;
-	uint8_t Rt = instr & 0x1f;
-	uint8_t S = (instr >> 12) & 1;
-	int width_shift = (size | (((opc & 2) & (simd << 1)) << 1));
-	// size==0 seems to be a bit special
-	// opc&2 is sign, opc&1 is load	(for most instructions anyways)
-
-	uint8_t load = opc & 1;
-	uint8_t extend_sign = ((opc & 2) >> 1 ) & !simd;
-	desc->pair = 0;
-
-	desc->simd = simd;
-	desc->width = 8 << width_shift;
-
-	// the simd instructions make this a bit weird
-	if (extend_sign) {
-		if (load) {
-			desc->extend_width = 32;
-		} else {
-			desc->extend_width = 64;
-		}
-		desc->load = 1;
-	} else {
-		desc->load = load;
-	}
-
-	desc->extendSign = extend_sign;	// needed for load, which isn't implemented yet
-
-	u64 offset = 0;
-	u64 addr = 0;
-	addr = regs->regs[Rn];
-	if (simd) {
-		int shift = 0;
-		if (S) shift = width_shift;
-		offset = extend_reg(regs->regs[Rm], option, shift);
-	} else {
-		int shift = 0;
-		if (S) shift = 2 << ((size & 1) & ((size >> 1) & 1));
-
-		offset = extend_reg(regs->regs[Rm], option, shift);
-	}
-
-	addr += offset;
-
-	//desc->data1 = regs->regs[Rt];
-	desc->reg1 = Rt;
-	desc->addr = (void *)addr;
-
-	return do_ls_fixup(instr, regs, desc);
-	return 0;
-}
-
-__always_inline int lsr_unscaled_immediate_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	uint8_t size = (instr >> 30) & 3;
-	uint8_t simd = (instr >> 26) & 1;
-	uint8_t opc = (instr >> 22) & 3;
-	uint16_t imm9 = (instr >> 12) & 0x1ff;
-	uint8_t Rn = (instr >> 5) & 0x1f;
-	uint8_t Rt = instr & 0x1f;
-
-	int16_t fullImm = 0;
-	// sign extend it
-	if (imm9 & 0x100) {
-		fullImm = 0xfe00 | imm9;
-	} else {
-		fullImm = imm9;
-	}
-	u64 addr = regs->regs[Rn];
-	desc->addr = addr + fullImm;
-	desc->pair = 0;
-
-	int load = opc & 1;
-	desc->load = load;
-	/*if (load) {
-		return 1;
-	}*/
-	desc->reg1 = Rt;
-	if (simd) {
-		desc->simd = 1;
-		desc->width = 8 << (size | ((opc & 2) << 1));
-		// assuming store
-		/*__uint128_t tmp;
-		read_simd_reg(Rt, &tmp);
-		desc->data1 = tmp;
-		desc->data1_simd = *(((u64*)&tmp) + 1);*/
-		return do_ls_fixup(instr, regs, desc);
-	} else {
-		desc->simd = 0;
-		desc->width = 8 << size;
-		return do_ls_fixup(instr, regs, desc);
-	}
-	///printk("SIMD: %d\n", simd);
-	return 1;
-}
-
-__always_inline int ls_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	uint8_t op0;
-	uint8_t op1;
-	uint8_t op2;
-	uint8_t op3;
-	uint8_t op4;
-
-	int r = 1;
-
-	op0 = (instr >> 28) & 0xf;
-	op1 = (instr >> 26) & 1;
-	op2 = (instr >> 23) & 3;
-	op3 = (instr >> 16) & 0x3f;
-	op4 = (instr >> 10) & 3;
-
-	if ((op0 & 3) == 2) {
-		desc->pair = 1;
-		r = ls_pair_fixup(instr, regs, desc);
-	}
-	if ((op0 & 3) == 0 && op1 == 0 && op2 == 1 && (op3 & 0x20) == 0x20) {
-		// compare and swap
-		r = ls_cas_fixup(instr, regs, desc);
-	}
-	if ((op0 & 3) == 3 && (op2 & 3) == 3) {
-		//load/store unsigned immediate
-		desc->pair = 0;
-
-	}
-	if ((op0 & 3) == 3 && ((op2 & 2) == 2)) {
-		// register unsigned immediate
-		r = ls_reg_unsigned_imm(instr, regs, desc);
-	}
-	if ((op0 & 3) == 3 && (op2 & 2) == 0 && (op3 & 0x20) == 0x20 && op4 == 2) {
-		// register offset load/store
-		r = lsr_offset_fixup(instr, regs, desc);
-	}
-	if ((op0 & 3) == 3 && (op2 & 2) == 0 && (op3 & 0x20) == 0x0 && op4 == 0) {
-		// register load/store unscaled immediate
-		r = lsr_unscaled_immediate_fixup(instr, regs, desc);
-	}
-	if (r) {
-		printk("Load/Store: op0 0x%x op1 0x%x op2 0x%x op3 0x%x op4 0x%x\n", op0, op1, op2, op3, op4);
-	}
-	return r;
-}
-
-__always_inline int system_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	uint8_t op1;
-	uint8_t op2;
-	uint8_t CRn;
-	uint8_t CRm;
-	uint8_t Rt;
-	bool L;
-	int r = 0;
-
-	op1 = (instr >> 16) & 0x7;
-	op2 = (instr >> 5) & 0x7;
-	CRn = (instr >> 12) & 0xf;
-	CRm = (instr >> 8) & 0xf;
-	L = (instr >> 21) & 1;
-	Rt = instr & 0x1f;
-
-	if (!L) {
-		// SYS
-		// proper decoding would be nicer here, but I don't expect to see too many system instructions
-		if ((op1 == 0x3) && (op2 == 1) && (CRn = 0x7) && (CRm == 4)) {
-			// dc zva
-			uint64_t dczid_el0 = read_sysreg_s(SYS_DCZID_EL0);
-			if (!((dczid_el0 >> DCZID_EL0_DZP_SHIFT) & 1)) {
-				uint16_t blksize = 4 << (dczid_el0 & 0xf);
-				r = memset_io_user(blksize, 0, regs->user_regs.regs[Rt]);
-				arm64_skip_faulting_instruction(regs, 4);
-				return r;
-			} else {
-				printk("DC ZVA is not allowed!\n");
-				return 1;
-			}
-		}
-	}
-
-	printk("Unhandled system instruction. op1=0x%x op2=0x%x CRn=0x%x CRm=0x%x\n", op1, op2, CRn, CRm);
-	return 1;
-}
-
-__always_inline int branch_except_system_fixup(u32 instr, struct pt_regs *regs, struct fixupDescription *desc)
-{
-	uint8_t op0;
-	uint32_t op1;
-	uint8_t op2;
-
-	op0 = (instr >> 29) & 0x7;
-	op1 = (instr >> 5) & 0x1fffff;
-	op2 = instr & 0x1f;
-
-	if ((op0 == 0x6) && (op1 & 0x1ec000) == 0x84000)
-		return system_fixup(instr, regs, desc);
-
-	printk("Unhandled Branch/Exception generating/System instruction. op0=0x%x op1=0x%x op2=0x%x\n", op0, op1, op2);
-	return 1;
-}
-
-uint32_t *seenCMDs;
-size_t seenCMDCount = 0;
-size_t seenCMDSize = 0;
-
-void instrDBG(u32 instr)
-{
-	for(size_t i = 0; i < seenCMDCount; i++) {
-		if (seenCMDs[i] == instr)
-			return;
-	}
-	if (seenCMDSize == 0) {
-		seenCMDs = krealloc(seenCMDs, 1, GFP_KERNEL);
-		seenCMDSize = 1;
-	}
-
-	if (seenCMDCount >= seenCMDSize) {
-		seenCMDs = krealloc(seenCMDs, seenCMDSize*2, GFP_KERNEL);
-		seenCMDSize *= 2;
-	}
-
-	seenCMDs[seenCMDCount] = instr;
-	seenCMDCount++;
-	printk("New instruction: %x", instr);
-}
-
+/* Main alignment fault handler - optimized for ARM64 instruction classification */
 int do_alignment_fixup(unsigned long addr, struct pt_regs *regs)
 {
-	unsigned long long instrptr;
 	u32 instr = 0;
-
-	instrptr = instruction_pointer(regs);
-	//printk("Alignment fixup\n");
-
-	if (alignment_get_arm64(regs, (__le64 __user *)instrptr, &instr)) {
-		printk("Failed to get aarch64 instruction\n");
+	int ret = get_fault_instruction(regs, &instr);
+	if (unlikely(ret)) {
+		// TODO: use `pr_debug` after debugging
+		printk("Failed to fetch faulting instruction at PC=0x%lx\n", 
+						instruction_pointer(regs));
 		return 1;
 	}
 
-	/**
-	 * List of seen faults: 020c00a9 (0xa9000c02) stp x2, x3, [x0]
-	 *
-	 */
+	/* ARM64-optimized instruction classification using bit patterns */
+	u8 op0 = (instr >> 25) & 0x1f;
 
-	//instrDBG(instr);
-
-	uint8_t op0;
-	int r;
-	struct fixupDescription desc = {0};
-	//desc.starttime = ktime_get_ns();
-	op0 = ((instr & 0x1E000000) >> 25);
-	if ((op0 & 5) == 0x4) {
-		//printk("Load/Store\n");
-		r = ls_fixup(instr, regs, &desc);
-		//desc.endtime = ktime_get_ns();
-		/*printk("Trap timing: decoding: %ldns, mem ops: %ldns, total: %ldns\n", desc.decodedtime - desc.starttime,
-				desc.endtime - desc.decodedtime, desc.endtime - desc.starttime);
-				*/
-		if (r)
-			printk("Faulting instruction: 0x%lx\n", instr);
-
-		return r;
+	/* Fast path for load/store instructions - most common case */
+	if (likely((op0 & 0x5) == 0x4)) {
+		ret = handle_ls_instruction(instr, regs);
+		if (unlikely(ret)) {
+			// TODO: use `pr_debug` after debugging
+			printk("Load/Store fixup failed: instr=0x%08x PC=0x%lx ret=%d\n",
+				instr, instruction_pointer(regs), ret);
+		}
+		return ret;
 	} else if ((op0 & 0xe) == 0xa) {
-		// System instructions, needed for dc zva
-		return branch_except_system_fixup(instr, regs, &desc);
+		/* Branch/Exception/System instructions */
+		return handle_branch_except_system(instr, regs);
 	} else {
-		printk("Not handling instruction with op0 0x%x (instruction is 0x%08x)", op0, instr);
+		/* Unsupported instruction type */
+		// TODO: use `pr_debug` after debugging
+		printk("Unsupported alignment fault: op0=0x%x instr=0x%08x PC=0x%lx\n",
+				   op0, instr, instruction_pointer(regs));
+		return -EINVAL;
 	}
-	return -1;
 }

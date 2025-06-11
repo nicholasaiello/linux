@@ -772,7 +772,8 @@ static int do_alignment_fault(unsigned long far, unsigned long esr,
 		if (do_alignment_fixup(far, regs) == 0)
 			return 0;
 
-		printk("Unfixed alignment issue\n");
+		// TODO: use pr_debug() instead of printk()
+		printk("Unfixed alignment issue!\n");
 	}
 
 	do_bad_area(far, esr, regs);

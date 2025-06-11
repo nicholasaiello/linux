@@ -152,4 +152,25 @@ static inline void arm64_mops_reset_regs(struct user_pt_regs *regs, unsigned lon
 	else
 		regs->pc -= 4;
 }
+
+// TODO: remove after testing
+
+#ifdef CONFIG_ARM64_ALIGNMENT_FIXUPS
+int do_alignment_fixup(unsigned long addr, struct pt_regs *regs);
+#else
+static inline int do_alignment_fixup(unsigned long addr, struct pt_regs *regs)
+{
+	return -EINVAL;
+}
+#endif
+
+#ifdef CONFIG_COMPAT_ALIGNMENT_FIXUPS  
+int do_compat_alignment_fixup(unsigned long addr, struct pt_regs *regs);
+#else
+static inline int do_compat_alignment_fixup(unsigned long addr, struct pt_regs *regs)
+{
+	return -EINVAL;
+}
+#endif
+
 #endif
